@@ -16,7 +16,6 @@ import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.os.Build;
 import android.os.Bundle;
-import android.util.Log;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -37,16 +36,17 @@ public class MainActivity extends AppCompatActivity {
     private TextView statusText;
     private ExecutorService cameraExecutor;
     private HandLandmarker handLandmarker;
-
-    // 📡 宣告我們的藍牙發射塔
     private BluetoothMouseHelper bluetoothMouseHelper;
 
-    private float prevX = 0f, prevY = 0f;
-    private final float alpha = 0.4f;
-    private final float pinchThreshold = 0.05f;
+    private boolean isFirstLaunch = true;
+    private boolean isSystemPopupShowing = false;
+    private boolean isDebuggingConnection = true;
 
-    // ⚙️ 游標靈敏度 (把 0~1 的小數比例，放大成滑鼠看得懂的像素移動量)
-    private final int SENSITIVITY = 2500;
+    private float prevX = 0f, prevY = 0f;
+    private final float alpha = 0.25f;
+    private final float pinchThreshold = 0.05f;
+    private final int SENSITIVITY = 4500;
+    private final int DEADZONE = 1;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -56,11 +56,11 @@ public class MainActivity extends AppCompatActivity {
 
         viewFinder = findViewById(R.id.viewFinder);
         statusText = findViewById(R.id.statusText);
-        cameraExecutor = Executors.newSingleThreadExecutor();
+        statusText.setTextSize(14f);
 
+        cameraExecutor = Executors.newSingleThreadExecutor();
         setupHandLandmarker();
 
-        // 檢查並要求所有權限 (包含相機與藍牙)
         if (checkPermissions()) {
             initSystem();
         } else {
@@ -68,9 +68,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ==========================================
-    // 權限大總管：處理 Android 12+ (S20 FE) 嚴格的藍牙權限
-    // ==========================================
     private String[] getRequiredPermissions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             return new String[]{
@@ -93,6 +90,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void requestPermissions() {
+        isSystemPopupShowing = true;
         ActivityCompat.requestPermissions(this, getRequiredPermissions(), PERMISSION_CODE);
     }
 
@@ -102,25 +100,71 @@ public class MainActivity extends AppCompatActivity {
         if (requestCode == PERMISSION_CODE && checkPermissions()) {
             initSystem();
         } else {
-            Toast.makeText(this, "必須允許所有權限才能啟動滑鼠功能！", Toast.LENGTH_LONG).show();
-            statusText.setText("權限不足，系統停擺");
+            Toast.makeText(this, "權限不足", Toast.LENGTH_LONG).show();
         }
     }
 
-    // ==========================================
-    // 系統初始化：開鏡頭 + 開藍牙
-    // ==========================================
     private void initSystem() {
         startCamera();
-
-        // 🌟 破解隱形魔法：強制讓手機對外廣播 120 秒
+        isSystemPopupShowing = true;
         android.content.Intent discoverableIntent = new android.content.Intent(android.bluetooth.BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE);
         discoverableIntent.putExtra(android.bluetooth.BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120);
         startActivity(discoverableIntent);
 
-        // 實體化藍牙發射塔
-        bluetoothMouseHelper = new BluetoothMouseHelper(this);
-        runOnUiThread(() -> statusText.setText("系統啟動，等待電腦藍牙配對..."));
+        statusText.setText("=== 藍牙探針初始化 ===");
+        setupBluetoothHelper();
+    }
+
+    private void setupBluetoothHelper() {
+        bluetoothMouseHelper = new BluetoothMouseHelper(this, (stepMsg, isFinished) -> runOnUiThread(() -> {
+            String currentText = statusText.getText().toString();
+            if (currentText.split("\n").length > 8) {
+                currentText = "=== 探針紀錄 ===";
+            }
+            statusText.setText(currentText + "\n" + stepMsg);
+
+            if (isFinished) {
+                new android.os.Handler().postDelayed(() -> {
+                    isDebuggingConnection = false;
+                    statusText.setTextSize(20f);
+                }, 2000);
+            }
+        }));
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+    }
+
+    // 🌟 終極自動修復機制：偵測到死亡，原地自動冷開機！
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (isFirstLaunch || isSystemPopupShowing) {
+            isFirstLaunch = false;
+            isSystemPopupShowing = false;
+            return;
+        }
+
+        isDebuggingConnection = true;
+        statusText.setTextSize(14f);
+        statusText.setText("=== App 返回前景 ===");
+
+        startCamera();
+
+        if (bluetoothMouseHelper != null && bluetoothMouseHelper.isReady()) {
+            // 如果管線幸運存活，直接盤點接軌
+            statusText.setText(statusText.getText() + "\n⚡ 服務存活，執行狀態盤點...");
+            bluetoothMouseHelper.checkAndReconnect();
+        } else {
+            // 如果管線被 Android 省電機制殺死了，啟動完美冷開機流程！
+            statusText.setText(statusText.getText() + "\n🔴 偵測到背景服務遭系統沒收，自動重啟全新連線...");
+            if (bluetoothMouseHelper != null) {
+                bluetoothMouseHelper.closeConnection();
+            }
+            setupBluetoothHelper();
+        }
     }
 
     private void setupHandLandmarker() {
@@ -133,9 +177,7 @@ public class MainActivity extends AppCompatActivity {
                     .setRunningMode(com.google.mediapipe.tasks.vision.core.RunningMode.IMAGE)
                     .build();
             handLandmarker = HandLandmarker.createFromOptions(this, options);
-        } catch (Exception e) {
-            Log.e("MediaPipe", "AI 模型載入失敗", e);
-        }
+        } catch (Exception e) {}
     }
 
     private void startCamera() {
@@ -156,10 +198,7 @@ public class MainActivity extends AppCompatActivity {
                 CameraSelector cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA;
                 cameraProvider.unbindAll();
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
-
-            } catch (Exception e) {
-                Log.e("CameraX", "相機啟動失敗", e);
-            }
+            } catch (Exception e) {}
         }, ContextCompat.getMainExecutor(this));
     }
 
@@ -179,41 +218,49 @@ public class MainActivity extends AppCompatActivity {
             float tx = result.landmarks().get(0).get(4).x();
             float ty = result.landmarks().get(0).get(4).y();
 
+            float moveX = result.landmarks().get(0).get(9).x();
+            float moveY = result.landmarks().get(0).get(9).y();
+
             if (prevX == 0f && prevY == 0f) {
-                prevX = ix; prevY = iy;
+                prevX = moveX; prevY = moveY;
             }
-            float smoothX = alpha * ix + (1 - alpha) * prevX;
-            float smoothY = alpha * iy + (1 - alpha) * prevY;
+            float smoothX = alpha * moveX + (1 - alpha) * prevX;
+            float smoothY = alpha * moveY + (1 - alpha) * prevY;
 
             float dx = smoothX - prevX;
             float dy = smoothY - prevY;
             prevX = smoothX; prevY = smoothY;
 
-            double distance = Math.hypot(smoothX - tx, smoothY - ty);
+            double distance = Math.hypot(ix - tx, iy - ty);
             boolean isClicked = distance < pinchThreshold;
 
-            // 🎯 將小數比例放大轉換為滑鼠的真實像素位移 (螢幕X軸與鏡頭是左右相反的，所以 dx 加負號)
             int mouseDx = (int) (-dx * SENSITIVITY);
             int mouseDy = (int) (dy * SENSITIVITY);
 
-            // 📡 呼叫發射塔！將算好的數值打給電腦
-            if (bluetoothMouseHelper != null && (Math.abs(mouseDx) > 0 || Math.abs(mouseDy) > 0 || isClicked)) {
+            if (Math.abs(mouseDx) < DEADZONE) mouseDx = 0;
+            if (Math.abs(mouseDy) < DEADZONE) mouseDy = 0;
+
+            if (bluetoothMouseHelper != null && (mouseDx != 0 || mouseDy != 0 || isClicked)) {
                 bluetoothMouseHelper.sendMouseEvent(mouseDx, mouseDy, isClicked);
             }
 
-            runOnUiThread(() -> {
-                if (isClicked) {
-                    statusText.setText("🟢 左鍵點擊發送中！");
-                    statusText.setTextColor(0xFF00FF00);
-                } else {
-                    statusText.setText(String.format("📡 游標移動發送中: X:%d Y:%d", mouseDx, mouseDy));
-                    statusText.setTextColor(0xFFFFFFFF);
-                }
-            });
+            final int displayDx = mouseDx;
+            final int displayDy = mouseDy;
+
+            if (!isDebuggingConnection) {
+                runOnUiThread(() -> {
+                    if (isClicked) {
+                        statusText.setText("🟢 左鍵點擊發送中！");
+                        statusText.setTextColor(0xFF00FF00);
+                    } else {
+                        statusText.setText(String.format("📡 游標移動: X:%d Y:%d", displayDx, displayDy));
+                        statusText.setTextColor(0xFFFFFFFF);
+                    }
+                });
+            }
         } else {
             prevX = 0f; prevY = 0f;
         }
-
         imageProxy.close();
     }
 
@@ -221,8 +268,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         cameraExecutor.shutdown();
-        if (handLandmarker != null) {
-            handLandmarker.close();
-        }
+        if (handLandmarker != null) handLandmarker.close();
+        if (bluetoothMouseHelper != null) bluetoothMouseHelper.closeConnection();
     }
 }
