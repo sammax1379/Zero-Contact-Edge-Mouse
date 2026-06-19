@@ -14,6 +14,7 @@ import androidx.core.content.ContextCompat;
 import android.Manifest;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.TextView;
@@ -31,38 +32,97 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity {
 
-    private static final int CAMERA_PERMISSION_CODE = 100;
+    private static final int PERMISSION_CODE = 100;
     private PreviewView viewFinder;
     private TextView statusText;
     private ExecutorService cameraExecutor;
     private HandLandmarker handLandmarker;
 
-    // ==========================================
-    // 🧠 系統全域變數 (與 Python 版邏輯相同)
-    // ==========================================
+    // 📡 宣告我們的藍牙發射塔
+    private BluetoothMouseHelper bluetoothMouseHelper;
+
     private float prevX = 0f, prevY = 0f;
-    private final float alpha = 0.4f; // 低通濾波器係數
-    private final float pinchThreshold = 0.05f; // 捏合閾值 (注意：手機端取得的座標是 0.0~1.0 的比例值)
+    private final float alpha = 0.4f;
+    private final float pinchThreshold = 0.05f;
+
+    // ⚙️ 游標靈敏度 (把 0~1 的小數比例，放大成滑鼠看得懂的像素移動量)
+    private final int SENSITIVITY = 2500;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setContentView(R.layout.activity_main);
 
         viewFinder = findViewById(R.id.viewFinder);
         statusText = findViewById(R.id.statusText);
         cameraExecutor = Executors.newSingleThreadExecutor();
 
-        setupHandLandmarker(); // 初始化 AI 大腦
+        setupHandLandmarker();
 
-        if (checkCameraPermission()) {
-            startCamera();
+        // 檢查並要求所有權限 (包含相機與藍牙)
+        if (checkPermissions()) {
+            initSystem();
         } else {
-            requestCameraPermission();
+            requestPermissions();
         }
     }
 
-    // 初始化 MediaPipe 手勢辨識器
+    // ==========================================
+    // 權限大總管：處理 Android 12+ (S20 FE) 嚴格的藍牙權限
+    // ==========================================
+    private String[] getRequiredPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return new String[]{
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_ADVERTISE
+            };
+        } else {
+            return new String[]{Manifest.permission.CAMERA};
+        }
+    }
+
+    private boolean checkPermissions() {
+        for (String permission : getRequiredPermissions()) {
+            if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void requestPermissions() {
+        ActivityCompat.requestPermissions(this, getRequiredPermissions(), PERMISSION_CODE);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == PERMISSION_CODE && checkPermissions()) {
+            initSystem();
+        } else {
+            Toast.makeText(this, "必須允許所有權限才能啟動滑鼠功能！", Toast.LENGTH_LONG).show();
+            statusText.setText("權限不足，系統停擺");
+        }
+    }
+
+    // ==========================================
+    // 系統初始化：開鏡頭 + 開藍牙
+    // ==========================================
+    private void initSystem() {
+        startCamera();
+
+        // 🌟 破解隱形魔法：強制讓手機對外廣播 120 秒
+        android.content.Intent discoverableIntent = new android.content.Intent(android.bluetooth.BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE);
+        discoverableIntent.putExtra(android.bluetooth.BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120);
+        startActivity(discoverableIntent);
+
+        // 實體化藍牙發射塔
+        bluetoothMouseHelper = new BluetoothMouseHelper(this);
+        runOnUiThread(() -> statusText.setText("系統啟動，等待電腦藍牙配對..."));
+    }
+
     private void setupHandLandmarker() {
         try {
             BaseOptions baseOptions = BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build();
@@ -83,15 +143,12 @@ public class MainActivity extends AppCompatActivity {
         cameraProviderFuture.addListener(() -> {
             try {
                 ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
-
-                // 1. 預覽畫面設定
                 Preview preview = new Preview.Builder().build();
                 preview.setSurfaceProvider(viewFinder.getSurfaceProvider());
 
-                // 2. 影像分析設定 (把每一幀交給 AI)
                 ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888) // 直接輸出 RGBA 方便轉換
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                         .build();
 
                 imageAnalysis.setAnalyzer(cameraExecutor, this::processImageProxy);
@@ -106,84 +163,58 @@ public class MainActivity extends AppCompatActivity {
         }, ContextCompat.getMainExecutor(this));
     }
 
-    // ==========================================
-    // 🧠 核心邏輯：處理每一張圖片與手勢數學
-    // ==========================================
     private void processImageProxy(ImageProxy imageProxy) {
         if (handLandmarker == null) {
             imageProxy.close();
             return;
         }
 
-        // 將 CameraX 畫面轉成 MediaPipe 看得懂的格式
         Bitmap bitmap = imageProxy.toBitmap();
         MPImage mpImage = new BitmapImageBuilder(bitmap).build();
-
-        // 進行手勢辨識
         HandLandmarkerResult result = handLandmarker.detect(mpImage);
 
-        // 如果有抓到手
         if (result.landmarks().size() > 0) {
-            // 🎯 抓取 食指指尖 (8) 與 大拇指指尖 (4)
             float ix = result.landmarks().get(0).get(8).x();
             float iy = result.landmarks().get(0).get(8).y();
             float tx = result.landmarks().get(0).get(4).x();
             float ty = result.landmarks().get(0).get(4).y();
 
-            // 數學魔法 1：EMA 低通濾波器
             if (prevX == 0f && prevY == 0f) {
                 prevX = ix; prevY = iy;
             }
             float smoothX = alpha * ix + (1 - alpha) * prevX;
             float smoothY = alpha * iy + (1 - alpha) * prevY;
 
-            // 計算相對位移 (這裡算出的是比例，未來發送藍牙前會乘上螢幕解析度)
             float dx = smoothX - prevX;
             float dy = smoothY - prevY;
             prevX = smoothX; prevY = smoothY;
 
-            // 數學魔法 2：歐式距離判定點擊
             double distance = Math.hypot(smoothX - tx, smoothY - ty);
             boolean isClicked = distance < pinchThreshold;
 
-            // 將結果顯示在螢幕最上方的文字中
+            // 🎯 將小數比例放大轉換為滑鼠的真實像素位移 (螢幕X軸與鏡頭是左右相反的，所以 dx 加負號)
+            int mouseDx = (int) (-dx * SENSITIVITY);
+            int mouseDy = (int) (dy * SENSITIVITY);
+
+            // 📡 呼叫發射塔！將算好的數值打給電腦
+            if (bluetoothMouseHelper != null && (Math.abs(mouseDx) > 0 || Math.abs(mouseDy) > 0 || isClicked)) {
+                bluetoothMouseHelper.sendMouseEvent(mouseDx, mouseDy, isClicked);
+            }
+
             runOnUiThread(() -> {
                 if (isClicked) {
-                    statusText.setText("🟢 [點擊] 左鍵觸發！");
-                    statusText.setTextColor(0xFF00FF00); // 綠色
+                    statusText.setText("🟢 左鍵點擊發送中！");
+                    statusText.setTextColor(0xFF00FF00);
                 } else {
-                    statusText.setText(String.format("➡️ [移動] dx: %.3f, dy: %.3f", dx, dy));
-                    statusText.setTextColor(0xFFFFFFFF); // 白色
+                    statusText.setText(String.format("📡 游標移動發送中: X:%d Y:%d", mouseDx, mouseDy));
+                    statusText.setTextColor(0xFFFFFFFF);
                 }
             });
         } else {
-            // 手離開畫面，重置歷史座標
             prevX = 0f; prevY = 0f;
-            runOnUiThread(() -> {
-                statusText.setText("尋找手勢中...");
-                statusText.setTextColor(0xFFFFFF00); // 黃色
-            });
         }
 
-        imageProxy.close(); // ⚠️ 必須關閉，否則相機會卡死
-    }
-
-    private boolean checkCameraPermission() {
-        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
-    }
-
-    private void requestCameraPermission() {
-        ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION_CODE);
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == CAMERA_PERMISSION_CODE && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startCamera();
-        } else {
-            Toast.makeText(this, "需要相機權限！", Toast.LENGTH_LONG).show();
-        }
+        imageProxy.close();
     }
 
     @Override
