@@ -21,7 +21,8 @@ import android.graphics.Paint;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
-import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -41,6 +42,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int PERMISSION_CODE = 100;
     private PreviewView viewFinder;
     private TextView statusText;
+    private Switch switchAr;
     private ExecutorService cameraExecutor;
     private HandLandmarker handLandmarker;
     private BluetoothMouseHelper bluetoothMouseHelper;
@@ -69,7 +71,7 @@ public class MainActivity extends AppCompatActivity {
     private long movementLockoutEndTime = 0;
     private final int MOVEMENT_LOCKOUT_MS = 250;
 
-    // 🌟 左手搖桿參數：調降靈敏度，必須拉開更遠才觸發 (0.05 -> 0.09)
+    // 左手搖桿參數
     private float leftAnchorX = -1f;
     private float leftAnchorY = -1f;
     private final float JOYSTICK_THRESHOLD = 0.09f;
@@ -81,18 +83,24 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-
-        // 🌟 強制鎖定為橫向模式 (支援根據重力 180 度翻轉，方便插充電線)
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE);
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setContentView(R.layout.activity_main);
 
         viewFinder = findViewById(R.id.viewFinder);
         statusText = findViewById(R.id.statusText);
-        statusText.setTextSize(14f);
+        switchAr = findViewById(R.id.switchAr);
 
+        // 🌟 將 AR 畫布塞進我們剛剛在 XML 建立的專屬容器裡，保證不會蓋住按鈕
+        FrameLayout overlayContainer = findViewById(R.id.overlayContainer);
         overlayView = new OverlayView(this);
-        addContentView(overlayView, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        overlayContainer.addView(overlayView);
+
+        // 🌟 綁定 AR 開關邏輯
+        switchAr.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (isChecked) overlayView.setVisibility(View.VISIBLE);
+            else overlayView.setVisibility(View.INVISIBLE);
+        });
 
         cameraExecutor = Executors.newSingleThreadExecutor();
         setupHandLandmarker();
@@ -159,13 +167,12 @@ public class MainActivity extends AppCompatActivity {
             if (isFinished) {
                 new android.os.Handler().postDelayed(() -> {
                     isDebuggingConnection = false;
-                    statusText.setTextSize(20f);
+                    statusText.setTextSize(16f); // 字體微調搭配新 UI
                 }, 2000);
             }
         }));
     }
 
-    // 🌟 多工優化：切換到背景時，主動斷開藍牙防止變成僵屍管線
     @Override
     protected void onPause() {
         super.onPause();
@@ -176,7 +183,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // 🌟 多工優化：切回前景時，強制要一條全新乾淨的管線
     @Override
     protected void onResume() {
         super.onResume();
@@ -188,7 +194,7 @@ public class MainActivity extends AppCompatActivity {
 
         isDebuggingConnection = true;
         statusText.setTextSize(14f);
-        statusText.setText("=== App 返回前景，重新建立連線 ===");
+        statusText.setText("=== 重新連線中 ===");
 
         startCamera();
 
@@ -437,7 +443,7 @@ public class MainActivity extends AppCompatActivity {
                         statusText.setText("🕹️ 左手搖桿觸發中：WASD 連續發射...");
                         statusText.setTextColor(0xFF33FF99);
                     } else {
-                        statusText.setText("📡 雙手全能控制端運作中 (橫向 AR 模式)");
+                        statusText.setText("📡 系統全能運作中 (橫向 AR 模式)");
                         statusText.setTextColor(0xFFFFFFFF);
                     }
                 });
